@@ -1,10 +1,9 @@
 """Tape-saturation DSP primitives for the audio-tape-saturate exercise.
 
 Audio is plain ``list[float]`` in the range ``[-1.0, 1.0]`` unless a function
-says otherwise.  Every function below is a stub and raises
-``NotImplementedError``; the docstrings define the contract that
-``tests/test_tape.py`` checks.  Unless stated otherwise, numeric comparisons
-use an absolute tolerance of ``1e-6``.
+says otherwise.  The contract each function implements is defined by its
+docstring and checked by ``tests/test_tape.py``.  Unless stated otherwise,
+numeric comparisons use an absolute tolerance of ``1e-6``.
 """
 
 from __future__ import annotations
@@ -43,7 +42,12 @@ def soft_clip(x: float, drive: float) -> float:
           output level linearly.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not drive > 0.0:
+        raise TapeError("drive must be positive")
+
+    # Normalising by tanh(drive) keeps a full-scale input at full scale, so
+    # raising the drive adds compression instead of linear gain.
+    return math.tanh(drive * x) / math.tanh(drive)
 
 
 def harmonics(x: float, amount: float) -> list[float]:
@@ -58,7 +62,14 @@ def harmonics(x: float, amount: float) -> list[float]:
           At ``x == 0.0`` the result is ``[0.0, 0.0]`` as well.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not 0.0 <= amount <= 1.0:
+        raise TapeError("amount must be in [0.0, 1.0]")
+
+    # Even (x**2) and odd (x**3) distortion terms, both proportional to the
+    # requested amount so that 0 gives no harmonics and 1 gives the full set.
+    second = amount * 0.5 * x * x
+    third = amount * 0.25 * x * x * x
+    return [second, third]
 
 
 def dc_block(samples: list[float], cutoff: float) -> list[float]:
@@ -75,7 +86,26 @@ def dc_block(samples: list[float], cutoff: float) -> list[float]:
           removed.  Empty input returns ``[]``.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not 0.0 < cutoff < 0.5:
+        raise TapeError("cutoff must be in (0.0, 0.5)")
+
+    if not samples:
+        return []
+
+    # y[n] = x[n] - x[n-1] + R * y[n-1].  R = exp(-2*pi*cutoff) keeps the pole
+    # inside the unit circle for every valid cutoff and places the corner at
+    # the requested normalised frequency; the zero at DC forces steady state
+    # to 0 while content above the corner passes through.
+    pole = math.exp(-2.0 * math.pi * cutoff)
+    output: list[float] = []
+    previous_input = 0.0
+    previous_output = 0.0
+    for value in samples:
+        current = value - previous_input + pole * previous_output
+        output.append(current)
+        previous_input = value
+        previous_output = current
+    return output
 
 
 def saturate(samples: list[float], drive: float, mix: float) -> list[float]:
@@ -92,7 +122,18 @@ def saturate(samples: list[float], drive: float, mix: float) -> list[float]:
         * Every output sample is bounded by ``[-1.0, 1.0]``.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not drive > 0.0:
+        raise TapeError("drive must be positive")
+    if not 0.0 <= mix <= 1.0:
+        raise TapeError("mix must be in [0.0, 1.0]")
+
+    if not samples:
+        return []
+
+    dry_gain = 1.0 - mix
+    return [
+        dry_gain * value + mix * soft_clip(value, drive) for value in samples
+    ]
 
 
 def tape_wobble(
@@ -116,7 +157,41 @@ def tape_wobble(
           same output.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not 0.0 <= depth <= 1.0:
+        raise TapeError("depth must be in [0.0, 1.0]")
+    if not rate > 0.0:
+        raise TapeError("rate must be positive")
+    if not sample_rate > 0.0:
+        raise TapeError("sample_rate must be positive")
+
+    if not samples:
+        return []
+
+    last = len(samples) - 1
+    output: list[float] = []
+    # The LFO phase advances by rate / sample_rate cycles per sample, i.e. it
+    # is driven by elapsed time rather than the frame index, so the
+    # modulation frequency in Hz does not depend on the sample rate.
+    phase_step = 2.0 * math.pi * rate / sample_rate
+    phase = 0.0
+    for index, _ in enumerate(samples):
+        delay = sample_rate * depth * 0.001 * math.sin(phase)
+        # Wrap the phase so precision does not degrade on long tracks.
+        phase = (phase + phase_step) % (2.0 * math.pi)
+        position = index - delay
+        if position < 0.0 or position > last:
+            output.append(0.0)
+            continue
+
+        left = int(math.floor(position))
+        fraction = position - left
+        if left >= last:
+            output.append(samples[last])
+        else:
+            output.append(
+                samples[left] * (1.0 - fraction) + samples[left + 1] * fraction
+            )
+    return output
 
 
 def hysteresis(x: float, prev: float, width: float) -> float:
@@ -132,7 +207,15 @@ def hysteresis(x: float, prev: float, width: float) -> float:
         * ``width == 0.0`` leaves ``prev`` unchanged.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    # Clamping keeps a negative width from producing a state step that runs
+    # opposite to the input (which is what made the input appear to reverse).
+    clamped = min(max(width, 0.0), 1.0)
+    step = x - prev
+    if step > clamped:
+        step = clamped
+    elif step < -clamped:
+        step = -clamped
+    return prev + step
 
 
 def measure_thd(samples: list[float], freq: float, sample_rate: float) -> float:
@@ -151,7 +234,40 @@ def measure_thd(samples: list[float], freq: float, sample_rate: float) -> float:
         * Empty input or a zero fundamental returns ``0.0``.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not freq > 0.0:
+        raise TapeError("freq must be positive")
+    if not sample_rate > freq:
+        raise TapeError("sample_rate must be greater than freq")
+
+    count = len(samples)
+    if count == 0:
+        return 0.0
+
+    def amplitude(multiple: float) -> float:
+        """Single-bin DFT amplitude at ``multiple * freq``."""
+        omega = 2.0 * math.pi * multiple * freq / sample_rate
+        real = 0.0
+        imaginary = 0.0
+        for index, value in enumerate(samples):
+            angle = omega * index
+            real += value * math.cos(angle)
+            imaginary += value * math.sin(angle)
+        return math.hypot(2.0 * real / count, 2.0 * imaginary / count)
+
+    fundamental = amplitude(1.0)
+    if fundamental == 0.0:
+        return 0.0
+
+    # Sum the *energy* (squared amplitudes) of every harmonic below Nyquist.
+    harmonic_energy = 0.0
+    multiple = 2.0
+    while multiple * freq < sample_rate / 2.0:
+        value = amplitude(multiple)
+        harmonic_energy += value * value
+        multiple += 1.0
+
+    thd = math.sqrt(harmonic_energy) / fundamental
+    return min(max(thd, 0.0), 1.0)
 
 
 def saturate_batch(
@@ -173,4 +289,48 @@ def saturate_batch(
           all-success run its keys therefore match the input order exactly.
         * Absolute tolerance for comparisons: ``1e-6``.
     """
-    raise NotImplementedError
+    if not isinstance(config, dict):
+        raise TapeError("config must be a dict")
+    if "drive" not in config:
+        raise TapeError("config requires a drive value")
+
+    drive = config["drive"]
+    mix = config.get("mix", 1.0)
+    width = config.get("width", 0.0)
+
+    if not isinstance(drive, (int, float)) or isinstance(drive, bool):
+        raise TapeError("drive must be a number")
+    if not drive > 0.0:
+        raise TapeError("drive must be positive")
+    if not isinstance(mix, (int, float)) or isinstance(mix, bool):
+        raise TapeError("mix must be a number")
+    if not 0.0 <= mix <= 1.0:
+        raise TapeError("mix must be in [0.0, 1.0]")
+    if not isinstance(width, (int, float)) or isinstance(width, bool):
+        raise TapeError("width must be a number")
+
+    if not isinstance(tracks, dict):
+        raise TapeError("tracks must be a dict")
+
+    # Validate every track up front so a bad track aborts the whole batch
+    # before any audio is processed (all-or-nothing rollback).
+    for name, track in tracks.items():
+        if not isinstance(track, (list, tuple)):
+            raise TapeError(f"track {name!r} must be a sequence")
+        for value in track:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TapeError(f"track {name!r} contains a non-numeric sample")
+            if not math.isfinite(value):
+                raise TapeError(f"track {name!r} contains a non-finite sample")
+
+    output: dict[str, list[float]] = {}
+    for name, track in tracks.items():
+        wet = saturate(list(track), drive, mix)
+        # A fresh state per track: hysteresis must never bleed across tracks.
+        previous = 0.0
+        processed: list[float] = []
+        for value in wet:
+            previous = hysteresis(value, previous, width)
+            processed.append(previous)
+        output[name] = processed
+    return output
